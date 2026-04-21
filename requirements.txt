@@ -1,0 +1,10 @@
+streamlit
+streamlit-ace
+ply
+requests
+joblib
+scikit-learn
+numpy
+colorama
+rich
+python-dotenv
