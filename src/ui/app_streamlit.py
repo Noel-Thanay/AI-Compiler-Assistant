@@ -74,6 +74,10 @@ if 'run_result' not in st.session_state:
     st.session_state.run_result = None
 if 'agent_fix' not in st.session_state:
     st.session_state.agent_fix = None
+if 'ns_result' not in st.session_state:
+    st.session_state.ns_result = None
+if 'ns_facts' not in st.session_state:
+    st.session_state.ns_facts = None
 if 'ac_engine' not in st.session_state:
     with st.spinner("Initialising autocomplete engine..."):
         engine = AutoCompleteEngine()
@@ -309,25 +313,167 @@ if st.session_state.run_result:
             st.warning("AST could not be generated. Fix syntax errors first.")
 
     with tab_agent:
-        st.markdown("#### Agentic AI Debugger")
-        st.caption("Uses AI (Gemini / Ollama) to reason about your code and propose a corrected patch.")
+        st.markdown("#### 🤖 Agentic AI Debugger")
+        st.caption(
+            "**Neuro-Symbolic Fusion** (60% Symbolic + 40% Neural)  ·  "
+            "**ReAct Loop** Plan → Act → Observe → Re-Fix (up to 3 iterations)"
+        )
 
         if agentic_on:
+
+            # ── Neuro-Symbolic Analysis Panel ─────────────────────────────────
+            with st.expander("🔬 Neuro-Symbolic Analysis", expanded=False):
+                st.caption(
+                    "Extracts structured symbolic facts from AST + diagnostics, "
+                    "then queries Llama 3 over those facts and fuses both scores."
+                )
+                if st.button("🧠 Run Neuro-Symbolic Analysis", key="ns_btn"):
+                    with st.spinner(
+                        "Step 1/3: Extracting symbolic facts from AST…"
+                    ):
+                        try:
+                            from src.agent.neuro_symbolic_analyzer import (
+                                NeuroSymbolicAnalyzer as _NSA,
+                            )
+                            _nsa = _NSA()
+                            # Symbolic extraction is instant (no LLM)
+                            facts = _nsa.extractor.extract(
+                                res["diag"], res.get("security", [])
+                            )
+                            st.session_state.ns_facts = facts
+                        except Exception as _e:
+                            st.session_state.ns_facts = None
+                            st.error(f"Symbolic extraction error: {_e}")
+
+                    if st.session_state.ns_facts:
+                        with st.spinner(
+                            "Step 2/3: Neural reasoning over symbolic facts…"
+                        ):
+                            try:
+                                ns_text = _nsa.analyze(
+                                    st.session_state.code,
+                                    res["diag"],
+                                    res.get("security", []),
+                                )
+                                st.session_state.ns_result = ns_text
+                            except Exception as _e:
+                                st.session_state.ns_result = f"❌ Neural reasoning error: {_e}"
+
+                # Show symbolic fact metrics (instant, no LLM needed)
+                if st.session_state.ns_facts:
+                    facts = st.session_state.ns_facts
+                    _c1, _c2, _c3, _c4 = st.columns(4)
+                    _c1.metric("🔴 Errors",        facts["error_count"])
+                    _c2.metric("🔒 Security",      facts["security_count"])
+                    _c3.metric("⚡ Optimizations", facts["optimization_count"])
+                    _c4.metric(
+                        "Symbolic Score",
+                        f"{facts['symbolic_score']} ({facts['severity_label']})",
+                    )
+
+                # Show full fused report
+                if st.session_state.ns_result:
+                    st.markdown(st.session_state.ns_result)
+
+            st.divider()
+
+            # ── Agentic Fix Loop ───────────────────────────────────────────────
+            st.markdown("**🔄 Agentic Fix Loop** — Plan → Act → Observe → Re-Fix")
             if st.button("🚀 Run Agentic Fix Loop", key="agent_btn"):
-                with st.spinner("AI Agent is reasoning..."):
+                st.session_state.agent_fix = None  # reset previous result
+                with st.spinner(
+                    "Agent running… each iteration re-compiles the fixed code "
+                    "(1–2 min per iteration when Ollama is running)"
+                ):
                     try:
                         agent = AgenticDebugger()
-                        fix = agent.debug_and_fix(
+                        fix_result = agent.debug_and_fix(
                             st.session_state.code,
                             res["diag"],
-                            model_name=ai_model
+                            model_name=ai_model,
                         )
-                        st.session_state.agent_fix = fix
+                        st.session_state.agent_fix = fix_result
                     except Exception as e:
-                        st.session_state.agent_fix = f"Agent error: {e}"
+                        st.session_state.agent_fix = {
+                            "error": str(e),
+                            "summary": f"❌ Agent error: {e}",
+                            "log": [],
+                            "converged": False,
+                            "iterations": 0,
+                            "fixed_code": st.session_state.code,
+                            "final_diagnostics": [],
+                        }
 
             if st.session_state.agent_fix:
-                st.markdown(st.session_state.agent_fix)
+                fix = st.session_state.agent_fix
+
+                if isinstance(fix, dict) and "log" in fix:
+
+                    # ── Convergence banner ──
+                    if fix.get("converged"):
+                        st.success(
+                            f"✅ **Converged** in {fix['iterations']} iteration(s) — "
+                            "all compiler issues resolved!"
+                        )
+                    else:
+                        st.warning(
+                            f"⚠️ Stopped after {fix['iterations']} iteration(s) — "
+                            "partial fix applied (see timeline below)."
+                        )
+
+                    # ── Iteration timeline ──
+                    if fix["log"]:
+                        st.markdown("**📋 Iteration Timeline**")
+                        _STATUS_ICONS = {
+                            "converged":         "🟢",
+                            "improved":          "🟡",
+                            "stale":             "🔴",
+                            "no_code_extracted": "🔴",
+                            "llm_error":         "🔴",
+                            "compile_error":     "🔴",
+                        }
+                        for step in fix["log"]:
+                            _icon  = _STATUS_ICONS.get(step["status"], "⚪")
+                            _in_c  = step["input_error_count"]
+                            _out_c = step.get("output_error_count", "N/A")
+                            with st.expander(
+                                f"{_icon} Iteration {step['iteration']}: "
+                                f"{_in_c} errors → {_out_c} errors  "
+                                f"`[{step['status']}]`",
+                                expanded=(step["status"] == "converged"),
+                            ):
+                                if step.get("error"):
+                                    st.error(f"Error: {step['error']}")
+                                if step.get("llm_response"):
+                                    st.markdown(step["llm_response"])
+                                if step.get("new_diagnostics"):
+                                    st.caption("Remaining diagnostics after this iteration:")
+                                    for _d in step["new_diagnostics"][:5]:
+                                        _line = _d.get('line', '?')
+                                        st.caption(
+                                            f"  • [{_d['type']}] Line {_line}: {_d['message']}"
+                                        )
+
+                    # ── Fixed code + Apply button ──
+                    _fixed = fix.get("fixed_code", "")
+                    if _fixed and _fixed != st.session_state.code:
+                        st.markdown("**📝 Proposed Fixed Code**")
+                        st.code(_fixed, language="c")
+                        if st.button(
+                            "✅ Apply Fix to Editor",
+                            key="apply_fix_btn",
+                            type="primary",
+                        ):
+                            st.session_state.code = _fixed
+                            st.session_state.agent_fix = None
+                            st.session_state.run_result = None
+                            st.rerun()
+
+                elif isinstance(fix, dict) and "error" in fix:
+                    st.error(fix.get("summary", "Agent encountered an error."))
+                else:
+                    st.markdown(str(fix))  # legacy string fallback
+
         else:
             st.info("Enable 'Agentic Self-Healing' in the sidebar to use this feature.")
 
